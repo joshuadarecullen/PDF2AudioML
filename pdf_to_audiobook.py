@@ -12,6 +12,9 @@ from TTS.api import TTS as TtsApi
 import time
 import subprocess # For ffmpeg check
 import types # For checking object types
+from collections import Counter
+from io import BytesIO
+import unicodedata
 
 # --- Configuration ---
 # Max characters per chunk. XTTS v2 limit is ~400 tokens.
@@ -39,6 +42,229 @@ logging.basicConfig(
 
 
 # --- Helper Functions ---
+
+def check_ocr_dependencies():
+    """Check if OCR dependencies are available."""
+    try:
+        import pytesseract
+        from PIL import Image
+        return True, None
+    except ImportError as e:
+        return False, str(e)
+
+def extract_text_with_ocr(page, confidence_threshold=60):
+    """Extract text from a page using OCR as fallback."""
+    try:
+        import pytesseract
+        from PIL import Image
+
+        # Get page as image
+        mat = fitz.Matrix(2, 2)  # 2x zoom for better OCR quality
+        pix = page.get_pixmap(matrix=mat)
+        img_data = pix.tobytes("png")
+        img = Image.open(BytesIO(img_data))
+
+        # Perform OCR with confidence data
+        ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+        # Filter out low-confidence text
+        text_parts = []
+        for i, conf in enumerate(ocr_data['conf']):
+            if int(conf) > confidence_threshold:
+                text = ocr_data['text'][i].strip()
+                if text:
+                    text_parts.append(text)
+
+        return ' '.join(text_parts)
+    except Exception as e:
+        logging.warning(f"OCR failed: {e}")
+        return ""
+
+def clean_text(text):
+    """Clean and normalize extracted text."""
+    if not text:
+        return ""
+
+    # Normalize unicode characters
+    text = unicodedata.normalize('NFKC', text)
+
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+
+    # Fix common OCR/extraction issues
+    text = re.sub(r'([a-z])-\s*\n\s*([a-z])', r'\1\2', text)  # Fix hyphenated words
+    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)  # Normalize paragraph breaks
+
+    # Remove page numbers (common patterns)
+    text = re.sub(r'\n\s*\d+\s*\n', '\n', text)  # Standalone numbers
+    text = re.sub(r'\n\s*Page\s+\d+\s*\n', '\n', text, flags=re.IGNORECASE)
+
+    # Remove common headers/footers (basic patterns)
+    lines = text.split('\n')
+    cleaned_lines = []
+
+    for line in lines:
+        line = line.strip()
+        # Skip very short lines that are likely page numbers or artifacts
+        if len(line) < 3 and line.isdigit():
+            continue
+        # Skip lines that are mostly special characters
+        if len(line) > 0 and len(re.sub(r'[^\w\s]', '', line)) / len(line) < 0.3:
+            continue
+        cleaned_lines.append(line)
+
+    return '\n'.join(cleaned_lines).strip()
+
+def detect_text_quality(text, min_word_length=3, min_alpha_ratio=0.7):
+    """Detect if extracted text quality is good enough."""
+    if not text or len(text) < 50:
+        return False, "Text too short"
+
+    words = text.split()
+    if len(words) < 10:
+        return False, "Too few words"
+
+    # Check for reasonable word lengths
+    avg_word_length = sum(len(word) for word in words) / len(words)
+    if avg_word_length < min_word_length:
+        return False, "Average word length too short"
+
+    # Check alphabetic character ratio
+    alpha_chars = sum(1 for char in text if char.isalpha())
+    total_chars = len(text.replace(' ', ''))
+    if total_chars > 0:
+        alpha_ratio = alpha_chars / total_chars
+        if alpha_ratio < min_alpha_ratio:
+            return False, f"Too few alphabetic characters ({alpha_ratio:.2f})"
+
+    return True, "Text quality acceptable"
+
+def extract_text_structured(page):
+    """Extract text using structured approach to maintain reading order."""
+    try:
+        # Get structured text data
+        text_dict = page.get_text("dict")
+
+        blocks = []
+        for block in text_dict["blocks"]:
+            if "lines" in block:  # Text block
+                block_text = ""
+                for line in block["lines"]:
+                    line_text = ""
+                    for span in line["spans"]:
+                        line_text += span["text"]
+                    block_text += line_text + "\n"
+
+                if block_text.strip():
+                    # Store block with its position for sorting
+                    bbox = block["bbox"]
+                    blocks.append({
+                        'text': block_text.strip(),
+                        'y': bbox[1],  # Top y-coordinate
+                        'x': bbox[0],  # Left x-coordinate
+                    })
+
+        # Sort blocks by position (top to bottom, left to right)
+        blocks.sort(key=lambda b: (b['y'], b['x']))
+
+        # Combine sorted blocks
+        return '\n\n'.join(block['text'] for block in blocks)
+    except Exception as e:
+        logging.warning(f"Structured text extraction failed: {e}")
+        return page.get_text("text")
+
+def extract_text_robust(pdf_path):
+    """
+    Robust PDF text extraction with multiple fallback methods.
+    """
+    logging.info(f"Starting robust text extraction from: {pdf_path}")
+
+    try:
+        doc = fitz.open(pdf_path)
+        logging.info(f"PDF opened successfully. Pages: {doc.page_count}")
+
+        # Check if PDF is password protected
+        if doc.needs_pass:
+            doc.close()
+            raise Exception("PDF is password protected")
+
+        full_text = ""
+        ocr_used = False
+        low_quality_pages = 0
+
+        # Check OCR availability once
+        ocr_available, ocr_error = check_ocr_dependencies()
+        if not ocr_available:
+            logging.warning(f"OCR not available: {ocr_error}. Install with: pip install pytesseract pillow")
+
+        for page_num in range(doc.page_count):
+            page = doc.load_page(page_num)
+            page_text = ""
+
+            # Method 1: Try structured text extraction
+            try:
+                page_text = extract_text_structured(page)
+            except Exception as e:
+                logging.warning(f"Structured extraction failed for page {page_num + 1}: {e}")
+                # Fallback to simple text extraction
+                page_text = page.get_text("text")
+
+            # Check text quality
+            is_good_quality, quality_reason = detect_text_quality(page_text)
+
+            # Method 2: Use OCR if text quality is poor and OCR is available
+            if not is_good_quality and ocr_available:
+                logging.info(f"Page {page_num + 1}: Text quality poor ({quality_reason}), trying OCR...")
+                ocr_text = extract_text_with_ocr(page)
+
+                # Compare OCR result quality
+                ocr_is_good, _ = detect_text_quality(ocr_text)
+                if ocr_is_good and len(ocr_text) > len(page_text):
+                    page_text = ocr_text
+                    ocr_used = True
+                    logging.info(f"Page {page_num + 1}: Using OCR result")
+                else:
+                    low_quality_pages += 1
+                    logging.warning(f"Page {page_num + 1}: Both extraction methods produced poor quality text")
+            elif not is_good_quality:
+                low_quality_pages += 1
+                logging.warning(f"Page {page_num + 1}: Poor text quality ({quality_reason}) and OCR not available")
+
+            # Clean the extracted text
+            page_text = clean_text(page_text)
+
+            if page_text:
+                full_text += page_text + "\n\n"
+
+            # Progress logging
+            if (page_num + 1) % 50 == 0 or (page_num + 1) == doc.page_count:
+                logging.info(f"Processed {page_num + 1}/{doc.page_count} pages...")
+
+        doc.close()
+
+        # Final text cleaning
+        full_text = clean_text(full_text)
+
+        # Summary logging
+        if ocr_used:
+            logging.info("OCR was used for some pages")
+        if low_quality_pages > 0:
+            logging.warning(f"{low_quality_pages} pages had low quality text extraction")
+
+        # Final quality check
+        if not full_text.strip():
+            raise Exception("No text could be extracted from PDF")
+
+        final_quality, final_reason = detect_text_quality(full_text)
+        if not final_quality:
+            logging.warning(f"Overall text quality warning: {final_reason}")
+
+        logging.info(f"Text extraction completed. Total characters: {len(full_text)}")
+        return full_text
+
+    except Exception as e:
+        logging.error(f"PDF text extraction failed: {e}")
+        raise
 
 def split_text_into_chunks(text):
     """
@@ -223,17 +449,15 @@ def pdf_to_audiobook(args):
         # --- 1. Text Extraction ---
         section_start_time = time.time()
         logging.info(f"--- Step 1: Extracting Text from PDF: {pdf_path} ---")
-        full_text = ""
         try:
-            doc = fitz.open(pdf_path)
-            logging.info(f"PDF opened successfully. Pages: {doc.page_count}")
-            for page_num in range(doc.page_count):
-                page = doc.load_page(page_num); text = page.get_text("text"); full_text += text + "\n"
-                if (page_num + 1) % 50 == 0 or (page_num + 1) == doc.page_count: logging.info(f"Processed {page_num + 1}/{doc.page_count} pages...")
-            doc.close()
+            full_text = extract_text_robust(pdf_path)
             logging.info(f"Finished extracting text. Total time: {time.time() - section_start_time:.2f}s")
-        except Exception as e: logging.error(f"Failed to extract text from PDF: {e}"); return
-        if not full_text.strip(): logging.error("Extracted text is empty."); return
+        except Exception as e:
+            logging.error(f"Failed to extract text from PDF: {e}");
+            return
+        if not full_text.strip():
+            logging.error("Extracted text is empty.");
+            return
 
         # --- 2. Text Chunking ---
         section_start_time = time.time()
@@ -377,7 +601,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="tts_models/multilingual/multi-dataset/xtts_v2", help="Name of the TTS model to use.")
     parser.add_argument("--output_format", type=str, default="mp3", choices=["mp3", "wav"], help="Output audio format. MP3 requires ffmpeg.")
 
-    # Dependency Check remains the same
+    # Dependency Check
     missing_deps = []
     try: import TTS
     except ImportError: missing_deps.append("TTS (pip install TTS)")
@@ -390,6 +614,17 @@ if __name__ == "__main__":
 
     if missing_deps:
         print("\nERROR: Missing required Python libraries:"); [print(f" - {dep}") for dep in missing_deps]; print("Install them first."); exit(1)
+
+    # Check optional OCR dependencies
+    optional_deps = []
+    try: import pytesseract
+    except ImportError: optional_deps.append("pytesseract (pip install pytesseract)")
+    try: from PIL import Image
+    except ImportError: optional_deps.append("Pillow (pip install Pillow)")
+
+    if optional_deps:
+        print("\nINFO: Optional OCR dependencies not found (for scanned PDFs):"); [print(f" - {dep}") for dep in optional_deps]
+        print("OCR functionality will be disabled. Install these for better scanned PDF support.\n")
 
     args = parser.parse_args()
     pdf_to_audiobook(args)

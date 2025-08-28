@@ -16,6 +16,11 @@ pydub
 torch
 torchaudio
 
+# Optional OCR Dependencies (for scanned PDFs)
+# These are optional but highly recommended for better PDF text extraction
+pytesseract
+Pillow
+
 # Common dependencies often used by TTS and related libraries for numerical processing and audio analysis.
 # While TTS might install these automatically, listing them can sometimes help resolve environment issues.
 # numpy
