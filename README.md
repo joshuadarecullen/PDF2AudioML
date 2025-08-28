@@ -1,6 +1,11 @@
 # PDF to Audiobook Converter
 
-A fork from https://github.com/RobertsBatars/pdf-to-audio
+A fork from https://github.com/RobertsBatars/pdf-to-audio 
+
+## Improvements
+
+I have included a more sophisticated pdf text extraction, that cleans page numbers and accounts for the structure of the text in the PDF.
+
 A Python tool that converts PDF documents to audiobooks using text-to-speech (TTS) technology. The script extracts text from PDFs and generates high-quality audio using the XTTSv2 model with optional voice cloning.
 
 ## Features
