@@ -1,0 +1,23 @@
+# requirements.txt for pdf_to_audiobook.py
+
+# PDF Text Extraction
+PyMuPDF
+
+# Text-to-Speech Engine
+coqui-tts
+
+# Audio Manipulation (combining chunks, exporting formats)
+pydub
+
+# Deep Learning Framework & Audio Backend (Required by TTS)
+# Ensure these versions are compatible with your CUDA setup.
+# You might need to install torch/torchaudio manually first using the specific CUDA version index URL from pytorch.org
+# e.g., pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118 (Replace cu118 with your CUDA version, e.g., cu121)
+torch
+torchaudio
+
+# Common dependencies often used by TTS and related libraries for numerical processing and audio analysis.
+# While TTS might install these automatically, listing them can sometimes help resolve environment issues.
+# numpy
+# librosa
+# soundfile
